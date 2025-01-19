@@ -1,6 +1,6 @@
 results/
 datasets/
-examples/
+./examples/
 wandb/
 *.gif
 *.mp4
