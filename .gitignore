@@ -1,0 +1,8 @@
+results/
+datasets/
+examples/
+wandb/
+*.gif
+*.mp4
+*.pt
+*.png

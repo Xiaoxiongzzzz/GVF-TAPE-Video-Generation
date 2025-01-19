@@ -671,15 +671,16 @@ class UNetModel(nn.Module):
             label_emb = self.task_attnpool(y).mean(dim=1)
             emb = emb + label_emb
 
-
         h = x.type(self.dtype)
         for module in self.input_blocks:
             h = module(h, emb)
             hs.append(h)
         h = self.middle_block(h, emb)
+        debug_list = []
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb)
+            debug_list.append(h)
         h = h.type(x.dtype)
         return self.out(h)
 

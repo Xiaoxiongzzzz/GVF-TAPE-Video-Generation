@@ -5,13 +5,13 @@ from random import random
 from functools import partial
 from collections import namedtuple
 from multiprocessing import cpu_count
-
+import wandb
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 
-from torch.optim import Adam
+from torch.optim import AdamW
 
 from torchvision import transforms as T, utils
 
@@ -23,7 +23,7 @@ from tqdm.auto import tqdm
 from ema_pytorch import EMA
 
 from accelerate import Accelerator
-
+from peft import LoraConfig, get_peft_model
 from pytorch_fid.inception import InceptionV3
 from pytorch_fid.fid_score import calculate_frechet_distance
 import matplotlib.pyplot as plt
@@ -350,7 +350,7 @@ class GoalGaussianDiffusion(nn.Module):
         beta_schedule = 'sigmoid',
         schedule_fn_kwargs = dict(),
         ddim_sampling_eta = 0.,
-        auto_normalize = True,
+        auto_normalize = False,
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
         min_snr_gamma = 5
     ):
@@ -659,7 +659,7 @@ class GoalGaussianDiffusion(nn.Module):
         b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
-        # noise sample
+        # noisy sample
 
         x = self.q_sample(x_start=x_start, t=t, noise=noise)
 
@@ -721,11 +721,19 @@ class Trainer(object):
         convert_image_to = None,
         calculate_fid = True,
         inception_block_idx = 2048, 
-        cond_drop_chance=0.1,
+        cond_drop_chance = 0.1,
+        use_wandb = False,
+        use_lora = False,
     ):
         super().__init__()
+        self.use_wandb = use_wandb  
+        self.use_lora = use_lora
 
         self.cond_drop_chance = cond_drop_chance
+        self.lr = train_lr
+        self.adam_betas = adam_betas
+        self.ema_decay = ema_decay
+        self.ema_update_every = ema_update_every
 
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
@@ -740,7 +748,6 @@ class Trainer(object):
         self.accelerator.native_amp = amp
 
         # model
-
         self.model = diffusion_model
 
         self.channels = channels
@@ -769,8 +776,6 @@ class Trainer(object):
         self.image_size = diffusion_model.image_size
 
         # dataset and dataloader
-
-        
         valid_ind = [i for i in range(len(valid_set))][:num_samples]
 
         train_set = train_set
@@ -779,18 +784,17 @@ class Trainer(object):
         self.ds = train_set
         self.valid_ds = valid_set
         dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = 4)
-        # dl = dataloader
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
         self.valid_dl = DataLoader(self.valid_ds, batch_size = valid_batch_size, shuffle = False, pin_memory = True, num_workers = 4)
 
-
         # optimizer
-
-        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
-
+        self.opt = AdamW(diffusion_model.parameters(), lr = train_lr)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.opt,
+            T_max=train_num_steps,
+        )
         # for logging results in a folder periodically
-
         if self.accelerator.is_main_process:
             self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
             self.ema.to(self.device)
@@ -803,9 +807,10 @@ class Trainer(object):
         self.step = 0
 
         # prepare model, dataloader, optimizer with accelerator
+        self.model, self.opt, self.text_encoder, self.scheduler = \
+            self.accelerator.prepare(self.model, self.opt, self.text_encoder, self.scheduler)
 
-        self.model, self.opt, self.text_encoder = \
-            self.accelerator.prepare(self.model, self.opt, self.text_encoder)
+        self.text_encoder.requires_grad_(False)
 
     @property
     def device(self):
@@ -826,16 +831,22 @@ class Trainer(object):
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
-    def load(self, milestone):
+    def load(self, milestone=None, checkpoint=None):
         accelerator = self.accelerator
         device = accelerator.device
-
-        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
+        finetune = False
+        if milestone is not None:
+            data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
+        else:
+            data = torch.load(checkpoint, map_location=device)
+            finetune = True
 
         model = self.accelerator.unwrap_model(self.model)
         model.load_state_dict(data['model'])
 
-        self.step = data['step']
+        if not finetune:
+            self.step = data['step']
+            
         self.opt.load_state_dict(data['opt'])
         if self.accelerator.is_main_process:
             self.ema.load_state_dict(data["ema"])
@@ -845,7 +856,6 @@ class Trainer(object):
 
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
-
     #     return fid_value
     def encode_batch_text(self, batch_text):
         batch_text_ids = self.tokenizer(batch_text, return_tensors = 'pt', padding = True, truncation = True, max_length = 128).to(self.device)
@@ -855,12 +865,19 @@ class Trainer(object):
     def sample(self, x_conds, batch_text, batch_size=1, guidance_weight=0):
         device = self.device
         task_embeds = self.encode_batch_text(batch_text)
-        return self.ema.ema_model.sample(x_conds.to(device), task_embeds.to(device), batch_size=batch_size, guidance_weight=guidance_weight)
 
+        if not self.use_lora:
+            return self.ema.ema_model.sample(x_conds.to(device), task_embeds.to(device), batch_size=batch_size, guidance_weight=guidance_weight)
+        else:
+            return self.ema.ema_model.base_model.sample(x_conds.to(device), task_embeds.to(device), batch_size=batch_size, guidance_weight=guidance_weight)
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
 
+        if accelerator.is_main_process:
+            if self.use_wandb:
+                wandb.init(project="AVDC", name="ddpm_libero_spatial")
+        ## train loop ##
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
             while self.step < self.train_num_steps:
@@ -868,19 +885,17 @@ class Trainer(object):
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
-                    x, x_cond, goal = next(self.dl)
+                    x, x_cond, task = next(self.dl)
                     x, x_cond = x.to(device), x_cond.to(device)
-
-                    goal_embed = self.encode_batch_text(goal)
-                    ### zero whole goal_embed if p < self.cond_drop_chance
+                    x = rearrange(x, "b f c h w -> b (f c) h w")
+                    
+                    goal_embed = self.encode_batch_text(task)
                     goal_embed = goal_embed * (torch.rand(goal_embed.shape[0], 1, 1, device = goal_embed.device) > self.cond_drop_chance).float()
-
 
                     with self.accelerator.autocast():
                         loss = self.model(x, x_cond, goal_embed)
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
-
                         self.accelerator.backward(loss)
 
                 accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -894,60 +909,66 @@ class Trainer(object):
                 self.opt.step()
                 self.opt.zero_grad()
 
+                self.scheduler.step()
+                current_lr = self.scheduler.get_last_lr()[0]
+
                 accelerator.wait_for_everyone()
 
                 self.step += 1
                 if accelerator.is_main_process:
                     self.ema.update()
 
-                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                    if self.use_wandb:
+                        wandb.log({'loss': total_loss, 'loss scale': scale, 'lr': current_lr})    
+
+                    if self.step % self.save_and_sample_every == 0:
                         self.ema.ema_model.eval()
 
                         with torch.no_grad():
                             milestone = self.step // self.save_and_sample_every
                             batches = num_to_groups(self.num_samples, self.valid_batch_size)
-                            ### get val_imgs from self.valid_dl
+                            
                             x_conds = []
                             xs = []
                             task_embeds = []
                             for i, (x, x_cond, label) in enumerate(self.valid_dl):
-                                xs.append(x)
-                                x_conds.append(x_cond.to(device))
+                                xs.append(rearrange(x, "b f c h w -> b (f c) h w"))
+                                x_conds.append(x_cond)
                                 task_embeds.append(self.encode_batch_text(label))
                             
                             with self.accelerator.autocast():
-                                all_xs_list = list(map(lambda n, c, e: self.ema.ema_model.sample(batch_size=n, x_cond=c, task_embed=e), batches, x_conds, task_embeds))
-                        
-                        print_gpu_utilization()
-                        
-                        gt_xs = torch.cat(xs, dim = 0) # [batch_size, 3*n, 120, 160]
-                        # make it [batchsize*n, 3, 120, 160]
-                        n_rows = gt_xs.shape[1] // 3
-                        gt_xs = rearrange(gt_xs, 'b (n c) h w -> b n c h w', n=n_rows)
-                        ### save images
-                        x_conds = torch.cat(x_conds, dim = 0).detach().cpu()
-                        # x_conds = rearrange(x_conds, 'b (n c) h w -> b n c h w', n=1)
-                        all_xs = torch.cat(all_xs_list, dim = 0).detach().cpu()
-                        all_xs = rearrange(all_xs, 'b (n c) h w -> b n c h w', n=n_rows)
+                                all_xs_list = list(map(lambda n, c, e: self.ema.ema_model.sample(batch_size=n, x_cond=c.to(device), task_embed=e), batches, x_conds, task_embeds))
+                            
+                            print_gpu_utilization()
+                            
+                            gt_xs = torch.cat(xs, dim = 0)
+                            n_rows = gt_xs.shape[1] // 3
+                            gt_xs = rearrange(gt_xs, 'b (n c) h w -> b n c h w', n=n_rows)
 
-                        gt_first = gt_xs[:, :1]
-                        gt_last = gt_xs[:, -1:]
+                            x_conds = torch.cat(x_conds, dim = 0).detach().cpu()
+                            all_xs = torch.cat(all_xs_list, dim = 0)
+                            all_xs = rearrange(all_xs, 'b (n c) h w -> (b n) c h w', n=n_rows)
+                            all_xs = all_xs.detach().cpu()
+                            all_xs = rearrange(all_xs, '(b n) c h w -> b n c h w', n=n_rows)
 
+                            gt_first = gt_xs[:, :1]
+                            gt_last = gt_xs[:, -1:]
 
+                            if self.step == self.save_and_sample_every:
+                                os.makedirs(str(self.results_folder / f'imgs'), exist_ok = True)
+                                gt_img = torch.cat([gt_first, gt_last, gt_xs], dim=1)
+                                gt_img = rearrange(gt_img, 'b n c h w -> (b n) c h w', n=n_rows+2)
+                                utils.save_image(gt_img, str(self.results_folder / f'imgs/gt_img.png'), nrow=n_rows+2)
 
-                        if self.step == self.save_and_sample_every:
-                            os.makedirs(str(self.results_folder / f'imgs'), exist_ok = True)
-                            gt_img = torch.cat([gt_first, gt_last, gt_xs], dim=1)
-                            gt_img = rearrange(gt_img, 'b n c h w -> (b n) c h w', n=n_rows+2)
-                            utils.save_image(gt_img, str(self.results_folder / f'imgs/gt_img.png'), nrow=n_rows+2)
+                            os.makedirs(str(self.results_folder / f'imgs/outputs'), exist_ok = True)
+                            pred_img = torch.cat([gt_first, gt_last,  all_xs], dim=1)
+                            pred_img = rearrange(pred_img, 'b n c h w -> (b n) c h w', n=n_rows+2)
+                            utils.save_image(pred_img, str(self.results_folder / f'imgs/outputs/sample-{milestone}.png'), nrow=n_rows+2)
 
-                        os.makedirs(str(self.results_folder / f'imgs/outputs'), exist_ok = True)
-                        pred_img = torch.cat([gt_first, gt_last,  all_xs], dim=1)
-                        pred_img = rearrange(pred_img, 'b n c h w -> (b n) c h w', n=n_rows+2)
-                        utils.save_image(pred_img, str(self.results_folder / f'imgs/outputs/sample-{milestone}.png'), nrow=n_rows+2)
-
-                        self.save(milestone)
+                            self.save(milestone)
 
                 pbar.update(1)
 
         accelerator.print('training complete')
+    
+

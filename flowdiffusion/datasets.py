@@ -9,8 +9,10 @@ import numpy as np
 import json
 import torchvision.transforms as T
 import random
-from torchvideotransforms import video_transforms, volume_transforms
+from torchvideotransforms import video_transforms, volume_transforms 
 from einops import rearrange
+import h5py
+import cv2
 # from vidaug import augmentors as va
 
 random.seed(0)
@@ -77,7 +79,138 @@ class SequentialDatasetNp(Dataset):
         x = torch.cat(images[1:], dim=0) # all other frames
         task = self.tasks[idx]
         return x, x_cond, task
+
+class LiberoDataset(Dataset):
+    def __init__(self, folder_path="/mnt/home/ZhangXiaoxiong/Data/atm_data/atm_libero/libero_spatial", sample_per_seq=7, target_size=(128, 128), augmentation=True):
+        print("Preparing dataset...")
+        self.sequences = []
+        self.tasks = []
+        self.sample_per_seq = sample_per_seq
+        self.augmentation = augmentation
+
+        hdf5_files = glob(os.path.join(folder_path, "*.hdf5"))      #The absolute path of the hdf5 file
+        for hdf5_file in hdf5_files:
+            seq, task = self.get_seq_from_hdf5(hdf5_file)
+            self.sequences.extend(seq)
+            self.tasks.extend(task)
+
+        self.transform = T.Compose([
+            T.Resize(target_size),
+            T.ToTensor()
+        ])
+        print("training_samples: ", len(self.sequences))
+        print("Done")
+    def get_seq_from_hdf5(self, hdf5_file):
+        sampled_frames_list = []
+        with h5py.File(hdf5_file, 'r') as f:
+            for traj in f['data'].keys():
+                frames = f['data'][traj]['obs']['agentview_rgb'][:]     #frames, width, height, channel
+                sampled_frames = self.get_samples(frames)
+                sampled_frames_list.append(sampled_frames)
+        task =  self.get_task_from_hdf5(hdf5_file)
+    
+        return sampled_frames_list, [task] * len(sampled_frames_list)
+
+    def get_task_from_hdf5(self, hdf5_file):
+        task = os.path.basename(hdf5_file).split('.')[0]
+        task = task.replace('_', ' ')
+        task = task.replace('demo', '')
         
+        return task
+
+    def get_samples(self, seq):
+        N = len(seq)
+        ### uniformly sample {self.sample_per_seq} frames, including the first and last frame
+        samples = []
+        for i in range(self.sample_per_seq-1):
+            samples.append(int(i*(N-1)/(self.sample_per_seq-1)))
+        samples.append(N-1)
+        return [cv2.flip(seq[i],0) for i in samples]
+
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        samples = self.sequences[idx]
+        images = [self.transform(Image.fromarray(s)) for s in samples]
+        x_cond = images[0] # first frame
+        x = torch.cat(images[1:], dim=0) # all other frames
+        task = self.tasks[idx]
+        return x, x_cond, task
+    
+class LiberoDatasetCloseLoop(Dataset):
+    def __init__(self, folder_path="/mnt/home/ZhangXiaoxiong/Data/atm_data/atm_libero/libero_spatial", sample_per_seq=7, target_size=(128, 128), interval=1, latent=True, train_ratio=0.4):
+        print("Preparing dataset...")
+        self.sideview_demo_list = []
+        self.task_list = []
+        self.sample_per_seq = sample_per_seq
+        self.interval = interval
+        self.latent = latent
+        self.train_ratio = train_ratio
+
+        hdf5_files = glob(os.path.join(folder_path, "./*.hdf5"), recursive=True)      #The absolute path of the hdf5 file
+        for hdf5_file in hdf5_files:
+            sideview_demos, tasks = self.get_demos_and_task_from_hdf5(hdf5_file)
+            self.sideview_demo_list.extend(sideview_demos)
+            self.task_list.extend(tasks)
+
+        self.transform = T.Compose([
+            T.Resize(target_size),
+            T.ToTensor(),
+        ])
+        print("Total number of demos: ", len(self.sideview_demo_list))
+        print("Done")
+    def get_demos_and_task_from_hdf5(self, hdf5_file):
+        '''
+        Args:
+        hdf5_file: path to hdf5 file(task)
+        '''
+        sideview_demos = []
+        with h5py.File(hdf5_file, 'r') as f:
+            all_traj = list(f['data'].keys())
+            random.shuffle(all_traj)
+            train_traj = all_traj[:int(len(all_traj)*self.train_ratio)]
+
+            for traj in train_traj:
+                sideview_demo = f['data'][traj]['latent_observation'][:] if self.latent else f['data'][traj]['obs']['agentview_rgb'][:]     #frames, height, width, channel
+                sideview_demos.append(sideview_demo)
+        task =  self.get_task_from_hdf5(hdf5_file)
+        tasks = [task] * len(sideview_demos)
+
+        return sideview_demos, tasks
+    def get_task_from_hdf5(self, hdf5_file):
+        task = os.path.basename(hdf5_file).split('.')[0]
+        task = task.replace('_', ' ')
+        task = task.replace('demo', '')
+        
+        return task
+    def get_seq_from_demo(self, demo):
+        '''
+        demo:[frames, height, width, channel]
+        '''
+        horizon = demo.shape[0]
+        start_index = np.random.randint(0, horizon-1-self.sample_per_seq-(self.sample_per_seq-1)*self.interval, 1)[0]
+        seq = demo[start_index:start_index+self.sample_per_seq+(self.sample_per_seq-1)*self.interval:self.interval+1]
+
+        return [torch.from_numpy(seq[i]) for i in range(len(seq))] if self.latent else [cv2.flip(seq[i], 0) for i in range(len(seq))]
+    def __len__(self):
+
+        return len(self.sideview_demo_list)
+    def __getitem__(self,idx):
+        sideview_demo = self.sideview_demo_list[idx]
+        task = self.task_list[idx]  
+        sideview_seq = self.get_seq_from_demo(sideview_demo)      #frames, height, width, channel
+
+        if not self.latent:
+            sideview_seq = [self.transform(Image.fromarray(s)) for s in sideview_seq]
+
+        sideview_seq = torch.stack(sideview_seq, dim=0)
+
+        x_cond = sideview_seq[0]
+        x = sideview_seq[1:]
+
+        return x, x_cond, task
+
 class SequentialDataset(SequentialDatasetNp):
     def __init__(self, path="../datasets/frederik/berkeley", sample_per_seq=7, target_size=(128, 128)):
         print("Preparing dataset...")

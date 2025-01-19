@@ -12,7 +12,7 @@ import tqdm
 from accelerate import Accelerator
 from datasets import SequentialDatasetNp, SequentialDatasetVal
 import argparse
-
+import wandb
 
 def main(args):
     valid_n = 1
@@ -24,10 +24,11 @@ def main(args):
     else:
         train_set = SequentialDatasetNp(
             sample_per_seq=sample_per_seq, 
-            path="../datasets/bridge/numpy/bridge_data_v1/berkeley/", 
+            path="/mnt/home/ZhangXiaoxiong/Data/BrideData", 
             target_size=target_size,
             debug=False,
         )
+
         valid_inds = [i for i in range(0, len(train_set), len(train_set)//valid_n)][:valid_n]
         valid_set = Subset(train_set, valid_inds)
     unet = Unet()
@@ -43,13 +44,12 @@ def main(args):
         model=unet,
         image_size=target_size,
         timesteps=100,
-        sampling_timesteps=args.sample_steps,
+        # sampling_timesteps=args.sampling_timesteps,
         loss_type='l2',
         objective='pred_v',
         beta_schedule = 'cosine',
         min_snr_loss_weight = True,
     )
-
     trainer = Trainer(
         diffusion_model=diffusion,
         tokenizer=tokenizer, 
@@ -65,9 +65,10 @@ def main(args):
         valid_batch_size =valid_n,
         gradient_accumulate_every = 1,
         num_samples=30, 
-        results_folder ='../results/bridge',
-        fp16 =True,
+        results_folder='../results/bridge',
+        fp16=True,
         amp=True,
+        use_wandb=args.use_wandb,
     )
 
     if args.checkpoint_num is not None:
@@ -109,6 +110,8 @@ if __name__ == "__main__":
     parser.add_argument('-p', '--inference_path', type=str, default=None) # path to input image
     parser.add_argument('-t', '--text', type=str, default=None) # task text 
     parser.add_argument('-g', '--guidance_weight', type=int, default=0) # set to positive to use guidance
+    parser.add_argument('--use-wandb', type=bool, default=None)
+
     args = parser.parse_args()
     if args.mode == 'inference':
         assert args.checkpoint_num is not None
