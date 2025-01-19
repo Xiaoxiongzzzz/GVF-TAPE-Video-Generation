@@ -6,3 +6,4 @@ wandb/
 *.mp4
 *.pt
 *.png
+*.npy
