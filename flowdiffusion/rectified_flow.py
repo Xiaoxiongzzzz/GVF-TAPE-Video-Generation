@@ -48,20 +48,21 @@ class RectifiedFlow:
         B = x_start.shape[0]
         if t is None:
             if self.sample_method == "uniform":
-                t = torch.rand((B,), device=x_start.device)
+                t = torch.rand((B,), device=x_start.device, dtype=x_start.dtype)
         else:
-            t = torch.Tensor([t] * B, device=x_start.device)
+            t = torch.full((B,), t, device=x_start.device, dtype=x_start.dtype)
 
         x_noisy, noise = self.add_noise(x_start, t)
         x_input = torch.cat([x_noisy, x_cond], dim=1)
         
-        noise_level = 1 - t
+        noise_level = (1 - t).to(dtype=x_start.dtype)  # 确保数据类型匹配
         vel_pred = model(x_input, noise_level, y)
         vel = x_start - noise
         
         loss = torch.mean((vel_pred - vel).pow(2))
 
         return loss
+
     def add_noise(
                 self,
                 x_start: torch.Tensor,
@@ -73,13 +74,12 @@ class RectifiedFlow:
             x_start: shape = [b, (f, c), h, w]
             t: shape = [b,] t=0 means prior distribution t=1 means data distribution
         """
-        t = t.view(-1, 1, 1, 1)
-        noise = torch.randn_like(x_start)
+        t = t.view(-1, 1, 1, 1)  # 保持维度变换
+        noise = torch.randn_like(x_start, device=x_start.device, dtype=x_start.dtype)
         
         noisy_x = t * x_start + (1 - t) * noise
         
         return noisy_x, noise
-        
 # # Test code
 # if __name__ == "__main__":
 #     from unet import UnetLatent as Unet

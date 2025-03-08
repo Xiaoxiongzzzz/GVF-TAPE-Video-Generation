@@ -1,7 +1,6 @@
-results/
-datasets/
-./examples/
-wandb/
+results
+examples
+wandb
 *.gif
 *.mp4
 *.pt

@@ -65,12 +65,12 @@ class RectifiedFlowTrainer:
             
     def setup_data(self):
         self.train_set = LiberoDatasetCloseLoop(
-            folder_path="/mnt/home/ZhangXiaoxiong/Data/atm_data/atm_libero/libero_spatial",
+            folder_path="/mnt/home/ZhangXiaoxiong/Data/atm_data/atm_libero/v2a",
             sample_per_seq=self.sample_per_seq,
             target_size=self.target_size,
             interval=self.interval,
             latent=self.args.latent_mode,
-            train_ratio=1,
+            train_ratio=0.4,
         )
         self.train_loader = cycle(DataLoader(self.train_set, batch_size=8, shuffle=True, num_workers=8))
 
@@ -172,15 +172,15 @@ class RectifiedFlowTrainer:
         n_row = images.shape[1]
         images = rearrange(images, "b f c h w -> (b f) c h w")
 
-        os.makedirs(f"./results/RFlow_libero_spatial_{self.args.latent_mode}/", exist_ok=True)
-        save_image(images, f"./results/RFlow_libero_spatial_{self.args.latent_mode}/sample_{step}.png", nrow=n_row)
+        os.makedirs(f"./results/RFlow_libero_90_{self.args.latent_mode}/", exist_ok=True)
+        save_image(images, f"./results/RFlow_libero_90_{self.args.latent_mode}/sample_{step}.png", nrow=n_row)
 
         if save_model:
             data = {
                 "step": step,
                 "model": self.unet.state_dict(),
             }
-            torch.save(data, f"./results/RFlow_libero_spatial_{self.args.latent_mode}/model_{step}.pt")
+            torch.save(data, f"./results/RFlow_libero_90_{self.args.latent_mode}/model_{step}.pt")
 
 def main(args):
     trainer = RectifiedFlowTrainer(args)

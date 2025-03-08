@@ -10,7 +10,7 @@ import torch
 from torch import nn, einsum
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
-
+from diffusers.models import AutoencoderKL
 from torch.optim import AdamW
 
 from torchvision import transforms as T, utils
@@ -721,13 +721,13 @@ class Trainer(object):
         convert_image_to = None,
         calculate_fid = True,
         inception_block_idx = 2048, 
-        cond_drop_chance = 0.1,
+        cond_drop_chance = 0.0,
         use_wandb = False,
-        use_lora = False,
+        use_latent = True,
     ):
         super().__init__()
         self.use_wandb = use_wandb  
-        self.use_lora = use_lora
+        self.use_latent = use_latent
 
         self.cond_drop_chance = cond_drop_chance
         self.lr = train_lr
@@ -737,14 +737,15 @@ class Trainer(object):
 
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
-
+            
         # accelerator
-
         self.accelerator = Accelerator(
             split_batches = split_batches,
             mixed_precision = 'fp16' if fp16 else 'no'
         )
-
+        
+        if self.use_latent:
+            self.setup_vae()
         self.accelerator.native_amp = amp
 
         # model
@@ -816,6 +817,11 @@ class Trainer(object):
     def device(self):
         return self.accelerator.device
 
+    def setup_vae(self):
+        self.vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae").to(self.device)
+        self.vae.requires_grad_(False)
+        self.vae.eval()
+
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
             return
@@ -866,10 +872,7 @@ class Trainer(object):
         device = self.device
         task_embeds = self.encode_batch_text(batch_text)
 
-        if not self.use_lora:
-            return self.ema.ema_model.sample(x_conds.to(device), task_embeds.to(device), batch_size=batch_size, guidance_weight=guidance_weight)
-        else:
-            return self.ema.ema_model.base_model.sample(x_conds.to(device), task_embeds.to(device), batch_size=batch_size, guidance_weight=guidance_weight)
+        return self.ema.ema_model.sample(x_conds.to(device), task_embeds.to(device), batch_size=batch_size, guidance_weight=guidance_weight)
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
@@ -888,7 +891,9 @@ class Trainer(object):
                     x, x_cond, task = next(self.dl)
                     x, x_cond = x.to(device), x_cond.to(device)
                     x = rearrange(x, "b f c h w -> b (f c) h w")
-                    
+                    if self.use_latent:
+                        x, x_cond = x.mul_(self.vae.config.scaling_factor), x_cond.mul_(self.vae.config.scaling_factor)        
+
                     goal_embed = self.encode_batch_text(task)
                     goal_embed = goal_embed * (torch.rand(goal_embed.shape[0], 1, 1, device = goal_embed.device) > self.cond_drop_chance).float()
 
@@ -933,7 +938,8 @@ class Trainer(object):
                             task_embeds = []
                             for i, (x, x_cond, label) in enumerate(self.valid_dl):
                                 xs.append(rearrange(x, "b f c h w -> b (f c) h w"))
-                                x_conds.append(x_cond)
+                                x_conds.append(x_cond.mul_(self.vae.config.scaling_factor) if self.use_latent
+                                                                                         else x_cond)
                                 task_embeds.append(self.encode_batch_text(label))
                             
                             with self.accelerator.autocast():
@@ -942,11 +948,13 @@ class Trainer(object):
                             print_gpu_utilization()
                             
                             gt_xs = torch.cat(xs, dim = 0)
-                            n_rows = gt_xs.shape[1] // 3
+                            n_rows = gt_xs.shape[1] // 4 if self.use_latent else gt_xs.shape[1] // 3
                             gt_xs = rearrange(gt_xs, 'b (n c) h w -> b n c h w', n=n_rows)
 
                             x_conds = torch.cat(x_conds, dim = 0).detach().cpu()
                             all_xs = torch.cat(all_xs_list, dim = 0)
+                            if self.use_latent:
+                                all_xs = all_xs.mul_(1/self.vae.config.scaling_factor)
                             all_xs = rearrange(all_xs, 'b (n c) h w -> (b n) c h w', n=n_rows)
                             all_xs = all_xs.detach().cpu()
                             all_xs = rearrange(all_xs, '(b n) c h w -> b n c h w', n=n_rows)
@@ -954,15 +962,12 @@ class Trainer(object):
                             gt_first = gt_xs[:, :1]
                             gt_last = gt_xs[:, -1:]
 
-                            if self.step == self.save_and_sample_every:
-                                os.makedirs(str(self.results_folder / f'imgs'), exist_ok = True)
-                                gt_img = torch.cat([gt_first, gt_last, gt_xs], dim=1)
-                                gt_img = rearrange(gt_img, 'b n c h w -> (b n) c h w', n=n_rows+2)
-                                utils.save_image(gt_img, str(self.results_folder / f'imgs/gt_img.png'), nrow=n_rows+2)
-
                             os.makedirs(str(self.results_folder / f'imgs/outputs'), exist_ok = True)
                             pred_img = torch.cat([gt_first, gt_last,  all_xs], dim=1)
                             pred_img = rearrange(pred_img, 'b n c h w -> (b n) c h w', n=n_rows+2)
+                            if self.use_latent:
+                                pred_img = self.vae.decode(pred_img.to(device)).sample
+                                pred_img = pred_img.detach().cpu()
                             utils.save_image(pred_img, str(self.results_folder / f'imgs/outputs/sample-{milestone}.png'), nrow=n_rows+2)
 
                             self.save(milestone)

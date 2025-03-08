@@ -13,22 +13,24 @@ import torch
 import wandb
 import argparse
 import os
+from accelerate import Accelerator
 
 class RectifiedFlowTrainer:
     def __init__(self, args):
         self.args = args
-        self.device = torch.device("cuda")
+        self.accelerator = Accelerator()
+        self.device = self.accelerator.device
         self.setup_wandb()
         self.setup_models()
         self.setup_data()
         
     def setup_wandb(self):
-        if self.args.use_wandb:
+        if self.args.use_wandb and self.accelerator.is_main_process:
             mode_name = 'latent' if self.args.latent_mode else 'pixel'
             wandb.init(project="AVDC", name=f"rectified-{mode_name}-flow-real-world")
 
     def setup_models(self):
-        self.unet = (UnetLatent() if self.args.latent_mode else UnetMW()).to(self.device)
+        self.unet = UnetLatent() if self.args.latent_mode else UnetMW()
         self.load_checkpoint()
         
         self.rectified_flow = RectifiedFlow(sample_timestep=self.args.sample_step)
@@ -38,6 +40,11 @@ class RectifiedFlowTrainer:
         self.optimizer = torch.optim.AdamW(self.unet.parameters(), lr=1e-4)
         self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=self.args.train_steps)
+            
+        # 使用 accelerator 准备模型、优化器等
+        self.unet, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
+            self.unet, self.optimizer, self.lr_scheduler
+        )
 
     def setup_clip(self):
         pretrained_model = "openai/clip-vit-base-patch32"
@@ -59,11 +66,15 @@ class RectifiedFlowTrainer:
 
     def setup_data(self):
         self.sample_per_seq = 7
-        self.interval = 2
+        self.interval = 1
 
         dataset_class = RealWorldDatasetLatent if self.args.latent_mode else RealWorldDataset
-        self.train_loader = self.create_dataloader(dataset_class, is_train=True)
-        self.valid_loader = self.create_dataloader(dataset_class, is_train=False)
+        train_loader = self.create_dataloader(dataset_class, is_train=True)
+        valid_loader = self.create_dataloader(dataset_class, is_train=False)
+        
+        # 使用 accelerator 准备数据加载器
+        self.train_loader = self.accelerator.prepare(train_loader)
+        self.valid_loader = self.accelerator.prepare(valid_loader)
 
     def create_dataloader(self, dataset_class, is_train=True):
         dataset = dataset_class(
@@ -83,38 +94,46 @@ class RectifiedFlowTrainer:
     def train_step(self, batch):
         x_start, x_cond, text = batch
         x_start, x_cond = x_start.to(self.device), x_cond.to(self.device)
+        
         if self.args.latent_mode:
             x_start, x_cond = self.process_latent(x_start, x_cond)
         else:
             x_start = rearrange(x_start, "b f c h w -> b (f c) h w")
 
         task_embed = self.encode_batch_text(text)
-        loss = self.rectified_flow.train_loss(self.unet, x_start, x_cond, task_embed)
         
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        self.lr_scheduler.step()
+        with self.accelerator.accumulate(self.unet):
+            loss = self.rectified_flow.train_loss(self.unet, x_start, x_cond, task_embed)
+            self.accelerator.backward(loss)
+            self.optimizer.step()
+            self.lr_scheduler.step()
+            self.optimizer.zero_grad()
 
         return loss.item()
 
     def train(self):
         save_every = 3000
 
-        for step in tqdm(range(self.initial_step + self.args.train_steps), initial=self.initial_step):
+        for step in tqdm(range(self.initial_step + self.args.train_steps), 
+                        initial=self.initial_step,
+                        disable=not self.accelerator.is_local_main_process):
             loss = self.train_step(next(self.train_loader))
             
-            if self.args.use_wandb:
+            if self.args.use_wandb and self.accelerator.is_main_process:
                 wandb.log({
                     "loss": loss,
                     "lr": self.lr_scheduler.get_last_lr()[0],
                 }, step=self.initial_step+step)
             
-            if step % save_every == 0:
+            if step % save_every == 0 and self.accelerator.is_main_process:
                 self.sample_and_save(step)
 
     @torch.no_grad()
     def sample_and_save(self, step, save_model=True):
+        # 确保只在主进程上进行采样和保存
+        if not self.accelerator.is_main_process:
+            return
+            
         with torch.no_grad():
             batch = next(self.valid_loader)
             x_start, x_cond, text = batch
@@ -148,15 +167,17 @@ class RectifiedFlowTrainer:
             n_row = images.shape[1]
             images = rearrange(images, "b f c h w -> (b f) c h w")
 
-            os.makedirs(f"./results/RFlow_real_world_{self.args.latent_mode}_final_{self.interval}/", exist_ok=True)
-            save_image(images, f"./results/RFlow_real_world_{self.args.latent_mode}_final_{self.interval}/sample_{step}.png", nrow=n_row)
+            os.makedirs(f"./results/real_world_{self.args.latent_mode}_final_{self.interval}/", exist_ok=True)
+            save_image(images, f"./results/real_world_{self.args.latent_mode}_final_{self.interval}/sample_{step}.png", nrow=n_row)
 
             if save_model:
+                # 获取未包装的模型状态字典
+                unwrapped_model = self.accelerator.unwrap_model(self.unet)
                 data = {
                     "step": step,
-                    "model": self.unet.state_dict(),
+                    "model": unwrapped_model.state_dict(),
                 }
-                torch.save(data, f"./results/RFlow_real_world_{self.args.latent_mode}_final_{self.interval}/model_{step}_final.pt")
+                torch.save(data, f"./results/real_world_{self.args.latent_mode}_final_{self.interval}/model_{step}_final.pt")
 
     def process_latent(self, x, x_cond):
         """

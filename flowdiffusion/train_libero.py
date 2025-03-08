@@ -1,5 +1,5 @@
 from goal_diffusion import GoalGaussianDiffusion, Trainer
-from unet import UnetMW as Unet
+from unet import UnetLatent, UnetMW
 from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers.models import AutoencoderKL
 from torch.utils.data import Dataset, DataLoader, Subset
@@ -17,10 +17,10 @@ import argparse
 import wandb
 def main(args):
     sample_per_seq = 7
-    target_size = [128, 128]
+    target_size = [64, 64] if args.latent else [128, 128]
     valid_n = 10
     interval = 4
-    unet = Unet()
+    unet = UnetLatent() if args.latent else UnetMW()
     pretrained_model = "openai/clip-vit-base-patch32"
     tokenizer = CLIPTokenizer.from_pretrained(pretrained_model)
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model)
@@ -28,7 +28,7 @@ def main(args):
     text_encoder.eval()
 
     diffusion = GoalGaussianDiffusion(
-    channels=3*(sample_per_seq-1),
+    channels=4*(sample_per_seq-1) if args.latent else 3*(sample_per_seq-1),
     model=unet,
     image_size=target_size,
     timesteps=100,
@@ -45,7 +45,7 @@ def main(args):
     sample_per_seq=sample_per_seq,
     target_size=target_size,
     interval=interval,
-    view="side_view",
+    latent=args.latent,
     train_ratio=1
     )
     valid_inds = [i for i in range(0, len(train_set), len(train_set)//valid_n)][:valid_n]
@@ -65,7 +65,7 @@ def main(args):
         valid_batch_size=valid_n,
         gradient_accumulate_every=1,
         num_samples=valid_n, 
-        results_folder='./results/ddpm_libero_spatial',
+        results_folder='./results/ddpm_libero_spatial_latent',
         fp16=True,
         amp=True,
         use_wandb=args.use_wandb,
@@ -81,6 +81,7 @@ if __name__ == "__main__":
     parser.add_argument('-m', '--mode', type=str, default='train', choices=['train', 'inference']) # 'train for training, 'inference' for generating samples
     parser.add_argument('-c', '--checkpoint_num', type=int, default=None) # checkpoint number to resume training or generate samples
     parser.add_argument('--use-wandb', type=bool, default=None)
+    parser.add_argument('--latent', type=bool, default=False)
     
     args = parser.parse_args()
     main(args)
