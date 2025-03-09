@@ -4,7 +4,6 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from torch.utils.data import Dataset, DataLoader, Subset
 from datasets import LiberoDatasetCloseLoop
 from diffusers.models import AutoencoderKL
-from peft import PeftConfig, PeftModel
 from goal_diffusion import cycle
 from einops import rearrange
 from tqdm import tqdm
@@ -65,11 +64,11 @@ class RectifiedFlowTrainer:
             
     def setup_data(self):
         self.train_set = LiberoDatasetCloseLoop(
-            folder_path="/mnt/home/ZhangXiaoxiong/Data/atm_data/atm_libero/v2a",
+            folder_path="/mnt/data0/xiaoxiong/atm_libero/libero_goal",
             sample_per_seq=self.sample_per_seq,
             target_size=self.target_size,
             interval=self.interval,
-            latent=self.args.latent_mode,
+            latent=False,
             train_ratio=0.4,
         )
         self.train_loader = cycle(DataLoader(self.train_set, batch_size=8, shuffle=True, num_workers=8))
@@ -131,8 +130,8 @@ class RectifiedFlowTrainer:
                     "lr": self.lr_scheduler.get_last_lr()[0],
                 }, step=self.initial_step+step)
                 
-            if step % self.save_every == 0:
-                self.sample_and_save(step)
+            # if step % self.save_every == 0:
+                # self.sample_and_save(step)
 
     def encode_batch_text(self, batch_text):
         batch_text_ids = self.tokenizer(batch_text, return_tensors='pt', padding=True, 
@@ -195,7 +194,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", default="train", type=str)
     parser.add_argument("--model-path", default=None, type=str)
     parser.add_argument("--sample-step", default=3, type=int)
-    parser.add_argument("--latent-mode", action="store_true")
+    parser.add_argument("--latent-mode", default=False, action="store_true")
 
     args = parser.parse_args()
     main(args)

@@ -9,7 +9,6 @@ import numpy as np
 import json
 import torchvision.transforms as T
 import random
-from torchvideotransforms import video_transforms, volume_transforms 
 from einops import rearrange
 import h5py
 import cv2
@@ -169,6 +168,7 @@ class LiberoDatasetCloseLoop(Dataset):
         with h5py.File(hdf5_file, 'r') as f:
             all_traj = list(f['data'].keys())
             random.shuffle(all_traj)
+            all_traj.remove("text_embed")
             train_traj = all_traj[:int(len(all_traj)*self.train_ratio)]
 
             for traj in train_traj:
