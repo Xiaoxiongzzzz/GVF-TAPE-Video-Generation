@@ -41,7 +41,8 @@ class RectifiedFlow:
         Args:
             model: nn.module
             x_start: shape = [b, (f, c), h, w]    
-            x_cond: shape = [b, c, h, w]
+            x_cond: shape = [b, c(3), h, w] 
+                    (We just use RGB image as condition no matter depth or not)
             y: shape = [b, c]   language embedding 
             t: float(0 - 1) or None
         """

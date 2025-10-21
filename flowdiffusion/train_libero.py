@@ -9,26 +9,28 @@ from PIL import Image
 from accelerate import Accelerator
 import numpy as np
 import torch.nn as nn
-import torch
-import os 
-import json
-import tqdm
 import argparse
 import wandb
 def main(args):
     sample_per_seq = 7
-    target_size = [64, 64] if args.latent else [128, 128]
+    target_size = [128, 128]
     valid_n = 10
     interval = 4
-    unet = UnetLatent() if args.latent else UnetMW()
-    pretrained_model = "openai/clip-vit-base-patch32"
-    tokenizer = CLIPTokenizer.from_pretrained(pretrained_model)
-    text_encoder = CLIPTextModel.from_pretrained(pretrained_model)
-    text_encoder.requires_grad_(False)
-    text_encoder.eval()
+    depth = True
+    save_and_sample_every = 5000
+    train_num_steps = 100000
+    train_batch_size = 8
+    unet = UnetMW(depth=depth)
+    train_ratio=0.4
+
+    # pretrained_model = "openai/clip-vit-base-patch32"
+    # tokenizer = CLIPTokenizer.from_pretrained(pretrained_model)
+    # text_encoder = CLIPTextModel.from_pretrained(pretrained_model)
+    # text_encoder.requires_grad_(False)
+    # text_encoder.eval()
 
     diffusion = GoalGaussianDiffusion(
-    channels=4*(sample_per_seq-1) if args.latent else 3*(sample_per_seq-1),
+    channels=4*(sample_per_seq-1),
     model=unet,
     image_size=target_size,
     timesteps=100,
@@ -39,40 +41,38 @@ def main(args):
     min_snr_loss_weight=True,
     )
 
-    
-    train_set = LiberoDatasetCloseLoop(
-    folder_path="/mnt/home/ZhangXiaoxiong/Data/atm_data/atm_libero/libero_spatial",
+    train_set = LiberoDatasetCloseLoop( 
+    folder_path="/home/ZhangChuye/Documents/vik_module/data/lb90_8tk_raw",
     sample_per_seq=sample_per_seq,
     target_size=target_size,
     interval=interval,
-    latent=args.latent,
-    train_ratio=1
+    depth=depth,
+    train_ratio=train_ratio,
     )
+
     valid_inds = [i for i in range(0, len(train_set), len(train_set)//valid_n)][:valid_n]
     valid_set = Subset(train_set, valid_inds)
     trainer = Trainer(
         diffusion_model=diffusion,
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
+        tokenizer=None,
+        text_encoder=None,
         train_set=train_set,
         valid_set=valid_set,
         train_lr=1e-4,
-        train_num_steps=100000,
-        save_and_sample_every=3000,
-        ema_update_every=10,
-        ema_decay=0.999,
-        train_batch_size=8,
+        train_num_steps=train_num_steps,
+        save_and_sample_every=save_and_sample_every,
+        train_batch_size=train_batch_size,
         valid_batch_size=valid_n,
-        gradient_accumulate_every=1,
         num_samples=valid_n, 
-        results_folder='./results/ddpm_libero_spatial_latent',
-        fp16=True,
-        amp=True,
+        results_folder='/mnt/data0/xiaoxiong/single_view_goal_diffusion/diffusion_results/v2a/DDPM_lb_8tasks_100%_100k',
+        fp16=False,
+        amp=False,
         use_wandb=args.use_wandb,
+        depth=depth
     )
     if args.checkpoint_num is not None:
         trainer.load(args.checkpoint_num)
-    
+    print(trainer.model)
     if args.mode == 'train':
         trainer.train()
 
@@ -80,8 +80,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-m', '--mode', type=str, default='train', choices=['train', 'inference']) # 'train for training, 'inference' for generating samples
     parser.add_argument('-c', '--checkpoint_num', type=int, default=None) # checkpoint number to resume training or generate samples
-    parser.add_argument('--use-wandb', type=bool, default=None)
-    parser.add_argument('--latent', type=bool, default=False)
+    parser.add_argument('--use-wandb', action='store_true', default=False)
     
     args = parser.parse_args()
     main(args)

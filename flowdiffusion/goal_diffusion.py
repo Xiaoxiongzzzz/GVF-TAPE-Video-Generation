@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 from diffusers.models import AutoencoderKL
 from torch.optim import AdamW
-
+from torchvision.utils import save_image
 from torchvision import transforms as T, utils
 
 from einops import rearrange, reduce, repeat
@@ -355,8 +355,6 @@ class GoalGaussianDiffusion(nn.Module):
         min_snr_gamma = 5
     ):
         super().__init__()
-        # assert not (type(self) == GoalGaussianDiffusion and model.channels != model.out_dim)
-        # assert not model.random_or_learned_sinusoidal_cond
 
         self.model = model
 
@@ -692,288 +690,457 @@ class GoalGaussianDiffusion(nn.Module):
         return self.p_losses(img, t, img_cond, task_embed)
 
 # trainer class
-
 class Trainer(object):
     def __init__(
         self,
         diffusion_model,
-        tokenizer, 
-        text_encoder, 
-        train_set,
-        valid_set,
-        channels = 3,
+        tokenizer=None,  # 可以设为可选参数
+        text_encoder=None,  # 可以设为可选参数
+        train_set=None,
+        valid_set=None,
+        channels=3,
         *,
-        train_batch_size = 1,
-        valid_batch_size = 1,
-        gradient_accumulate_every = 1,
-        augment_horizontal_flip = True,
-        train_lr = 1e-4,
-        train_num_steps = 100000,
-        ema_update_every = 10,
-        ema_decay = 0.995,
-        adam_betas = (0.9, 0.99),
-        save_and_sample_every = 1000,
-        num_samples = 3,
-        results_folder = './results',
-        amp = True,
-        fp16 = True,
-        split_batches = True,
-        convert_image_to = None,
-        calculate_fid = True,
-        inception_block_idx = 2048, 
-        cond_drop_chance = 0.0,
-        use_wandb = False,
-        use_latent = True,
+        train_batch_size=1,
+        valid_batch_size=1,
+        train_lr=1e-4,
+        train_num_steps=100000,
+        adam_betas=(0.9, 0.99),
+        save_and_sample_every=1000,
+        num_samples=3,
+        results_folder='./results',
+        amp=True,
+        fp16=True,
+        split_batches=True,
+        calculate_fid=True,
+        inception_block_idx=2048,
+        cond_drop_chance=0.0,
+        use_wandb=False,
+        depth=False,
+        num_frames=6,
+        sample_per_seq=7,
+        interval=4,
+        train_ratio=0.9,
+        target_size=[128, 128],
+        seed=None,
     ):
         super().__init__()
-        self.use_wandb = use_wandb  
-        self.use_latent = use_latent
-
+        # Save parameters
+        self.use_wandb = use_wandb
         self.cond_drop_chance = cond_drop_chance
+        self.depth = depth
+        self.num_frames = num_frames
+        self.sample_per_seq = sample_per_seq
+        self.interval = interval
+        self.train_ratio = train_ratio
+        self.target_size = target_size
+        self.seed = seed
+        
+        # Training related parameters
         self.lr = train_lr
         self.adam_betas = adam_betas
-        self.ema_decay = ema_decay
-        self.ema_update_every = ema_update_every
-
+        self.train_num_steps = train_num_steps
+        
+        # Text encoding related - now optional
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
             
-        # accelerator
+        # Setup accelerator
         self.accelerator = Accelerator(
-            split_batches = split_batches,
-            mixed_precision = 'fp16' if fp16 else 'no'
+            split_batches=split_batches,
+            mixed_precision='fp16' if fp16 else 'no',
+            log_with="wandb" if use_wandb else None
         )
         
-        if self.use_latent:
-            self.setup_vae()
+        # Native amp setup
         self.accelerator.native_amp = amp
 
-        # model
+        # Model
         self.model = diffusion_model
-
         self.channels = channels
 
-        # InceptionV3 for fid-score computation
-
+        # InceptionV3 for FID score calculation
         self.inception_v3 = None
-
         if calculate_fid:
             assert inception_block_idx in InceptionV3.BLOCK_INDEX_BY_DIM
             block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[inception_block_idx]
             self.inception_v3 = InceptionV3([block_idx])
             self.inception_v3.to(self.device)
 
-        # sampling and training hyperparameters
-
-        # assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
+        # Sampling and training hyperparameters
         self.num_samples = num_samples
         self.save_and_sample_every = save_and_sample_every
-
         self.batch_size = train_batch_size
         self.valid_batch_size = valid_batch_size
-        self.gradient_accumulate_every = gradient_accumulate_every
-
-        self.train_num_steps = train_num_steps
         self.image_size = diffusion_model.image_size
 
-        # dataset and dataloader
-        valid_ind = [i for i in range(len(valid_set))][:num_samples]
+        # Setup datasets and data loaders
+        self.setup_datasets(train_set, valid_set)
+        
+        # Setup optimizer and scheduler
+        self.setup_optimizer_and_scheduler()
 
-        train_set = train_set
-        valid_set = Subset(valid_set, valid_ind)
-
-        self.ds = train_set
-        self.valid_ds = valid_set
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = 4)
-        dl = self.accelerator.prepare(dl)
-        self.dl = cycle(dl)
-        self.valid_dl = DataLoader(self.valid_ds, batch_size = valid_batch_size, shuffle = False, pin_memory = True, num_workers = 4)
-
-        # optimizer
-        self.opt = AdamW(diffusion_model.parameters(), lr = train_lr)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.opt,
-            T_max=train_num_steps,
-        )
-        # for logging results in a folder periodically
-        if self.accelerator.is_main_process:
-            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
-            self.ema.to(self.device)
-
+        # Result saving directory
         self.results_folder = Path(results_folder)
-        self.results_folder.mkdir(exist_ok = True, parents = True)
+        self.results_folder.mkdir(exist_ok=True, parents=True)
 
-        # step counter state
-
+        # Step counter
         self.step = 0
 
-        # prepare model, dataloader, optimizer with accelerator
-        self.model, self.opt, self.text_encoder, self.scheduler = \
-            self.accelerator.prepare(self.model, self.opt, self.text_encoder, self.scheduler)
+        # Prepare model and optimizer with accelerator
+        to_prepare = [self.model, self.opt, self.scheduler]
+        # 只有在提供了文本编码器的情况下才准备它
+        if self.text_encoder is not None:
+            to_prepare.append(self.text_encoder)
+            prepared = self.accelerator.prepare(*to_prepare)
+            self.model, self.opt, self.scheduler, self.text_encoder = prepared
+            # Text encoder doesn't need gradients
+            self.text_encoder.requires_grad_(False)
+            self.text_encoder.eval()
+        else:
+            prepared = self.accelerator.prepare(*to_prepare)
+            self.model, self.opt, self.scheduler = prepared
+        
+        # If using wandb, initialize accelerator's trackers
+        if self.use_wandb:
+            self.setup_wandb()
 
-        self.text_encoder.requires_grad_(False)
+    def setup_wandb(self):
+        """Setup wandb tracker"""
+        if not self.accelerator.is_main_process:
+            return
+            
+        full_config = {
+            "model": {
+                "depth": self.depth,
+                "num_frames": self.num_frames,
+                "learning_rate": self.lr,
+                "train_steps": self.train_num_steps,
+                "batch_size": self.batch_size,
+                "num_gpus": self.accelerator.num_processes,
+                "effective_batch": self.batch_size * self.accelerator.num_processes,
+            },
+            
+            "data": {
+                "target_size": self.target_size,
+                "sample_per_seq": self.sample_per_seq,
+                "interval": self.interval,
+                "train_ratio": self.train_ratio,
+            },
+            
+            "training": {
+                "save_every": self.save_and_sample_every,
+                "scheduler_T_max": self.train_num_steps * self.accelerator.num_processes,
+                "seed": self.seed,
+            }
+        }
+        
+        self.accelerator.init_trackers(
+            project_name="AVDC",
+            config=full_config,
+            init_kwargs={"wandb": {
+                "name": f"goal-diffusion-{'rgbd' if self.depth else 'rgb'}-{self.accelerator.num_processes}gpus",
+                "tags": ["multi-gpu", "goal-diffusion"],
+            }}
+        )
+
+    def setup_datasets(self, train_set, valid_set):
+        """Setup datasets and data loaders"""
+        # Select samples for validation set
+        valid_inds = [i for i in range(len(valid_set))][:self.num_samples]
+        self.valid_set = Subset(valid_set, valid_inds)
+        self.valid_set.augmentation = False
+
+        # Setup training set
+        self.train_set = train_set
+        
+        # Create data loaders
+        train_dl = DataLoader(
+            self.train_set, 
+            batch_size=self.batch_size, 
+            shuffle=True, 
+            pin_memory=True, 
+            num_workers=8
+        )
+        
+        # Prepare training data loader
+        self.train_dl = self.accelerator.prepare(train_dl)
+        self.train_dl = cycle(self.train_dl)
+        
+        # Setup validation data loader
+        self.valid_dl = DataLoader(
+            self.valid_set, 
+            batch_size=self.valid_batch_size, 
+            shuffle=False, 
+            pin_memory=True, 
+            num_workers=8
+        )
+        
+    def setup_optimizer_and_scheduler(self):
+        """Setup optimizer and learning rate scheduler"""
+        self.opt = AdamW(self.model.parameters(), lr=self.lr, betas=self.adam_betas)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.opt,
+            T_max=self.train_num_steps 
+        )
 
     @property
     def device(self):
         return self.accelerator.device
 
-    def setup_vae(self):
-        self.vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae").to(self.device)
-        self.vae.requires_grad_(False)
-        self.vae.eval()
-
     def save(self, milestone):
+        """Save model checkpoint"""
         if not self.accelerator.is_local_main_process:
             return
 
         data = {
             'step': self.step,
             'model': self.accelerator.get_state_dict(self.model),
-            'opt': self.opt.state_dict(),
-            'ema': self.ema.state_dict(),
+            'optimizer': self.opt.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
             'version': __version__
         }
 
-        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+        # Ensure ckpt directory exists
+        save_dir = self.results_folder / 'ckpt'
+        save_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Save model
+        torch.save(data, str(save_dir / f'model_{milestone}.pt'))
 
-    def load(self, milestone=None, checkpoint=None):
+    def load(self, milestone=None, checkpoint=None, fine_tune=False):
+        """Load model checkpoint"""
         accelerator = self.accelerator
         device = accelerator.device
-        finetune = False
+        
+        # Load model based on provided milestone or checkpoint
         if milestone is not None:
-            data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
+            data = torch.load(str(self.results_folder / f'ckpt/model_{milestone}.pt'), map_location=device)
         else:
             data = torch.load(checkpoint, map_location=device)
-            finetune = True
 
+        # Load model state
         model = self.accelerator.unwrap_model(self.model)
-        model.load_state_dict(data['model'])
-
-        if not finetune:
-            self.step = data['step']
+        model_checkpoint = data['model']
+        
+        # Handle module. prefix (do this for all processes, not just main)
+        if any(k.startswith('module.') for k in model_checkpoint.keys()):
+            model_checkpoint = {k.replace('module.', ''): v for k, v in model_checkpoint.items()}
+        
+        # 确保模型状态字典中的键匹配
+        missing_keys, unexpected_keys = model.load_state_dict(model_checkpoint, strict=False)
+        if missing_keys:
+            print(f"Warning: Missing keys in state dict: {missing_keys}")
+        if unexpected_keys:
+            print(f"Warning: Unexpected keys in state dict: {unexpected_keys}")
             
-        self.opt.load_state_dict(data['opt'])
-        if self.accelerator.is_main_process:
-            self.ema.load_state_dict(data["ema"])
+        # If not fine-tuning mode, restore training state
+        if not fine_tune:
+            self.step = data['step']
+            print(f"Restored model state from step {self.step}")
+            
+            # Load optimizer state
+            if "optimizer" in data:
+                self.opt.load_state_dict(data["optimizer"])
+                print("Restored optimizer state")
+            
+            # Load scheduler state
+            if "scheduler" in data:
+                self.scheduler.load_state_dict(data["scheduler"])
+                print("Restored scheduler state")
 
-        if 'version' in data:
-            print(f"loading from version {data['version']}")
-
-        if exists(self.accelerator.scaler) and exists(data['scaler']):
+        # Load scaler state
+        if exists(self.accelerator.scaler) and exists(data.get('scaler')):
             self.accelerator.scaler.load_state_dict(data['scaler'])
-    #     return fid_value
-    def encode_batch_text(self, batch_text):
-        batch_text_ids = self.tokenizer(batch_text, return_tensors = 'pt', padding = True, truncation = True, max_length = 128).to(self.device)
-        batch_text_embed = self.text_encoder(**batch_text_ids).last_hidden_state
-        return batch_text_embed
+            print("Restored scaler state")
+            
+        if 'version' in data:
+            print(f"Loading from version {data['version']}")
+            
+        # 等待所有进程完成加载
+        accelerator.wait_for_everyone()
 
-    def sample(self, x_conds, batch_text, batch_size=1, guidance_weight=0):
+    def sample(self, x_conds, task_embeds, batch_size=1, guidance_weight=0):
+        """Generate samples using the model with provided task embeddings"""
         device = self.device
-        task_embeds = self.encode_batch_text(batch_text)
+        
+        # 获取未包装的原始模型
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        
+        return unwrapped_model.sample(
+            x_conds.to(device), 
+            task_embeds.to(device), 
+            batch_size=batch_size, 
+            guidance_weight=guidance_weight
+        )
 
-        return self.ema.ema_model.sample(x_conds.to(device), task_embeds.to(device), batch_size=batch_size, guidance_weight=guidance_weight)
     def train(self):
+        """Train the model"""
         accelerator = self.accelerator
         device = accelerator.device
 
-        if accelerator.is_main_process:
-            if self.use_wandb:
-                wandb.init(project="AVDC", name="ddpm_libero_spatial")
-        ## train loop ##
-        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+        # Create progress bar
+        disable_progress_bar = not accelerator.is_local_main_process
+        progress_bar = tqdm(
+            range(self.step, self.train_num_steps),
+            disable=disable_progress_bar
+        )
 
-            while self.step < self.train_num_steps:
+        for step in progress_bar:
+            # Get next batch of data
+            x, x_cond, task_embed = next(self.train_dl)
+            x, x_cond, task_embed = x.to(device), x_cond.to(device), task_embed.to(device)
+            
+            # Rearrange dimensions
+            x = rearrange(x, "b f c h w -> b (f c) h w")
+            
+            # Apply condition dropping if needed
+            if self.cond_drop_chance > 0:
+                task_embed = task_embed * (torch.rand(task_embed.shape[0], 1, 1, device=task_embed.device) > self.cond_drop_chance).float()
 
-                total_loss = 0.
+            # Forward and backward pass
+            with self.accelerator.autocast():
+                loss = self.model(x, x_cond, task_embed)
+                self.accelerator.backward(loss)
 
-                for _ in range(self.gradient_accumulate_every):
-                    x, x_cond, task = next(self.dl)
-                    x, x_cond = x.to(device), x_cond.to(device)
-                    x = rearrange(x, "b f c h w -> b (f c) h w")
-                    if self.use_latent:
-                        x, x_cond = x.mul_(self.vae.config.scaling_factor), x_cond.mul_(self.vae.config.scaling_factor)        
+            # Gradient clipping
+            accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
 
-                    goal_embed = self.encode_batch_text(task)
-                    goal_embed = goal_embed * (torch.rand(goal_embed.shape[0], 1, 1, device = goal_embed.device) > self.cond_drop_chance).float()
+            # Get loss scale
+            scale = self.accelerator.scaler.get_scale() if exists(self.accelerator.scaler) else 1.0
+            
+            # Update progress bar description
+            progress_bar.set_postfix(loss=f"{loss.item():.4E}", loss_scale=f"{scale:.1E}")
 
-                    with self.accelerator.autocast():
-                        loss = self.model(x, x_cond, goal_embed)
-                        loss = loss / self.gradient_accumulate_every
-                        total_loss += loss.item()
-                        self.accelerator.backward(loss)
+            # Wait for all processes
+            accelerator.wait_for_everyone()
 
-                accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+            # Update model parameters
+            self.opt.step()
+            self.opt.zero_grad()
 
-                scale = self.accelerator.scaler.get_scale()
-                
-                pbar.set_description(f'loss: {total_loss:.4E}, loss scale: {scale:.1E}')
+            # Update learning rate
+            self.scheduler.step()
+            current_lr = self.scheduler.get_last_lr()[0]
 
-                accelerator.wait_for_everyone()
+            # Wait for all processes again
+            accelerator.wait_for_everyone()
 
-                self.opt.step()
-                self.opt.zero_grad()
+            # Increment step
+            self.step += 1
+            
+            # Operations performed by main process
+            if accelerator.is_main_process:
+                # Log metrics
+                if self.use_wandb:
+                    self.accelerator.log({
+                        'loss': loss.item(), 
+                        'loss_scale': scale, 
+                        'lr': current_lr
+                    }, step=step)
 
-                self.scheduler.step()
-                current_lr = self.scheduler.get_last_lr()[0]
+                # Periodically sample and save
+                if self.step % self.save_and_sample_every == 0:
+                    self.sample_and_save(step)
 
-                accelerator.wait_for_everyone()
+            # Update progress bar
+            progress_bar.update(1)
 
-                self.step += 1
-                if accelerator.is_main_process:
-                    self.ema.update()
+        self.sample_and_save(self.train_num_steps)
+        accelerator.print('Training complete')
 
-                    if self.use_wandb:
-                        wandb.log({'loss': total_loss, 'loss scale': scale, 'lr': current_lr})    
+    @torch.no_grad()
+    def sample_and_save(self, step, save_model=True):
+        """Generate samples and save model"""
+        # Only execute in main process
+        if not self.accelerator.is_main_process:
+            return
+            
+        # Set model to evaluation mode
+        self.model.eval()
+        
+        # Load validation set samples
+        xs = []
+        x_conds = []
+        task_embeds = []
+        
+        for x, x_cond, task_embed in self.valid_dl:
+            xs.append(rearrange(x, "b f c h w -> b (f c) h w"))
+            x_conds.append(x_cond)
+            task_embeds.append(task_embed)  # 直接使用数据集提供的嵌入
+        
+        device = self.device
+        batches = num_to_groups(self.num_samples, self.valid_batch_size)
+        
+        # Generate samples using the model
+        with self.accelerator.autocast():
+            # 获取未包装的原始模型
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            all_xs_list = list(map(
+                lambda n, c, e: unwrapped_model.sample(
+                    batch_size=n, 
+                    x_cond=c.to(device), 
+                    task_embed=e.to(device)  # 确保嵌入在正确的设备上
+                ), 
+                batches, x_conds, task_embeds
+            ))
+        
+        # Process ground truth and generated samples
+        gt_xs = torch.cat(xs, dim=0)
+        n_rows = self.num_frames
+        gt_xs = rearrange(gt_xs, 'b (n c) h w -> b n c h w', n=n_rows)
 
-                    if self.step % self.save_and_sample_every == 0:
-                        self.ema.ema_model.eval()
+        x_conds = torch.cat(x_conds, dim=0).detach().cpu()
+        all_xs = torch.cat(all_xs_list, dim=0)
+        all_xs = rearrange(all_xs, 'b (n c) h w -> (b n) c h w', n=n_rows)
+        all_xs = all_xs.detach().cpu()
+        all_xs = rearrange(all_xs, '(b n) c h w -> b n c h w', n=n_rows)
 
-                        with torch.no_grad():
-                            milestone = self.step // self.save_and_sample_every
-                            batches = num_to_groups(self.num_samples, self.valid_batch_size)
-                            
-                            x_conds = []
-                            xs = []
-                            task_embeds = []
-                            for i, (x, x_cond, label) in enumerate(self.valid_dl):
-                                xs.append(rearrange(x, "b f c h w -> b (f c) h w"))
-                                x_conds.append(x_cond.mul_(self.vae.config.scaling_factor) if self.use_latent
-                                                                                         else x_cond)
-                                task_embeds.append(self.encode_batch_text(label))
-                            
-                            with self.accelerator.autocast():
-                                all_xs_list = list(map(lambda n, c, e: self.ema.ema_model.sample(batch_size=n, x_cond=c.to(device), task_embed=e), batches, x_conds, task_embeds))
-                            
-                            print_gpu_utilization()
-                            
-                            gt_xs = torch.cat(xs, dim = 0)
-                            n_rows = gt_xs.shape[1] // 4 if self.use_latent else gt_xs.shape[1] // 3
-                            gt_xs = rearrange(gt_xs, 'b (n c) h w -> b n c h w', n=n_rows)
+        # Extract first and last frame for comparison
+        gt_first = gt_xs[:, :1]
+        gt_last = gt_xs[:, -1:]
 
-                            x_conds = torch.cat(x_conds, dim = 0).detach().cpu()
-                            all_xs = torch.cat(all_xs_list, dim = 0)
-                            if self.use_latent:
-                                all_xs = all_xs.mul_(1/self.vae.config.scaling_factor)
-                            all_xs = rearrange(all_xs, 'b (n c) h w -> (b n) c h w', n=n_rows)
-                            all_xs = all_xs.detach().cpu()
-                            all_xs = rearrange(all_xs, '(b n) c h w -> b n c h w', n=n_rows)
+        # Create save directory
+        save_dir = os.path.join(self.results_folder, f"{'depth_' if self.depth else ''}imgs")
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # If RGBD mode, save RGB and depth images separately
+        if self.depth:
+            # Separate RGB and depth channels from generated samples
+            rgb_sample = all_xs[:, :, :3]
+            depth_sample = all_xs[:, :, 3:4]
+            
+            # Process RGB channels
+            rgb_gt_start = gt_first[:, :, :3]  # First frame RGB
+            rgb_gt_last = gt_last[:, :, :3]    # Last frame RGB
+            
+            # Get ground truth depth from last frame
+            depth_gt_last = gt_last[:, :, 3:4]  # Extract depth channel from last frame
+            
+            # Concatenate RGB images (condition, target RGB, generated RGB)
+            rgb_images = torch.cat([rgb_gt_start, rgb_gt_last, rgb_sample], dim=1)
+            # Concatenate depth images (ground truth depth, generated depth)
+            depth_images = torch.cat([depth_gt_last, depth_sample], dim=1)
+            
+            # Prepare for visualization
+            n_row_rgb = rgb_images.shape[1]
+            n_row_depth = depth_images.shape[1]
+            rgb_images = rearrange(rgb_images, "b f c h w -> (b f) c h w")
+            depth_images = rearrange(depth_images, "b f c h w -> (b f) c h w")
+            
+            # Save images
+            save_image(rgb_images, os.path.join(save_dir, f"sample_rgb_{step}.png"), nrow=n_row_rgb)
+            save_image(depth_images, os.path.join(save_dir, f"sample_depth_{step}.png"), nrow=n_row_depth)
+        else:
+            # Process RGB images only
+            images = torch.cat([gt_first, gt_last, all_xs], dim=1)
+            n_row = images.shape[1]
+            images = rearrange(images, "b f c h w -> (b f) c h w")
+            save_image(images, os.path.join(save_dir, f"sample_{step}.png"), nrow=n_row)
 
-                            gt_first = gt_xs[:, :1]
-                            gt_last = gt_xs[:, -1:]
-
-                            os.makedirs(str(self.results_folder / f'imgs/outputs'), exist_ok = True)
-                            pred_img = torch.cat([gt_first, gt_last,  all_xs], dim=1)
-                            pred_img = rearrange(pred_img, 'b n c h w -> (b n) c h w', n=n_rows+2)
-                            if self.use_latent:
-                                pred_img = self.vae.decode(pred_img.to(device)).sample
-                                pred_img = pred_img.detach().cpu()
-                            utils.save_image(pred_img, str(self.results_folder / f'imgs/outputs/sample-{milestone}.png'), nrow=n_rows+2)
-
-                            self.save(milestone)
-
-                pbar.update(1)
-
-        accelerator.print('training complete')
-    
-
+        # Return model to training mode
+        self.model.train()
+        
+        # Save model checkpoint
+        if save_model:
+            self.save(step)

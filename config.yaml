@@ -1,0 +1,4 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU  # 分布式类型
+gpu_ids: "0, 1, 2, 3, 4, 5, 6, 7"  # 使用的GPU ID
+num_processes: 8 # 进程数
