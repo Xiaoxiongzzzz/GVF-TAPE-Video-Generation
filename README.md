@@ -17,4 +17,12 @@ You can set up the environment with conda
 git clone https://github.com/Xiaoxiongzzzz/GVF-TAPE-Video-Generation.git
 cd GVF-TAPE-Video-Generation
 conda env create -f environment.yml
+conda activate videogenerator
 ```
+## Dataset Structure
+The pytorch dataset class is defined in ./flowdiffusion/dataset.py.
+
+This class is based on [LIBERO](https://libero-project.github.io/main.html) dataset with some modification:
+* Agentview_rgb in LIBERO dataset is upside down, you need to invert it.
+* If you need generate RGB-D videos, then augment this dataset with depth information is needed. It's can be achieved by using [VideoDepthAnything](https://github.com/DepthAnything/Video-Depth-Anything) or other model.
+* Preprocess the task description to text embedding and save it to dataset. */flowdiffusion/preprocess_dataset.py script could do this.
