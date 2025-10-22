@@ -1,4 +1,4 @@
-name: avdc
+name: videogenerator
 channels:
   - defaults
   - conda-forge
@@ -159,4 +159,3 @@ dependencies:
       - wandb==0.18.3
       - werkzeug==3.0.4
       - zipp==3.20.2
-prefix: /mnt/data0/xiaoxiong/miniconda3/envs/avdc
