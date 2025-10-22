@@ -40,3 +40,5 @@ In our experiments, sample step = 3 is enough for LIBERO.
 This codebase is based on [AVDC](https://github.com/flow-diffusion/AVDC), thanks for their excellent code.
 
 Contact [Xiaoxiong Zhang](https://xiaoxiongzzzz.github.io) if you have any questions and suggestions.
+
+Other parts of our codes will be released soon.
