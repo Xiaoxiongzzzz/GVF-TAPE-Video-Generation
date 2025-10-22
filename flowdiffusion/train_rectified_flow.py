@@ -4,7 +4,6 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from torch.utils.data import Dataset, DataLoader, Subset
 from datasets import LiberoDatasetCloseLoop
 from diffusers.models import AutoencoderKL
-from goal_diffusion import cycle
 from einops import rearrange
 from tqdm import tqdm
 from torchvision.utils import save_image
@@ -17,7 +16,10 @@ from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from tqdm import tqdm
 
-device = torch.device("cuda")
+def cycle(dl):
+    while True:
+        for data in dl:
+            yield data
 
 class RectifiedFlowTrainer:
     def __init__(self, args):
@@ -48,16 +50,16 @@ class RectifiedFlowTrainer:
         self.interval = 4
         self.depth = args.depth
         self.learning_rate = 1e-4
-        self.batch_size = 8
-        self.data_path = "/mnt/data0/xiaoxiong/atm_libero/libero_spatial"
+        self.batch_size = 1
+        self.data_path = "PATH/TO/YOUR/DATASET"
 
         # Video generation parameters
         self.num_frames = 6  # Number of frames to generate
         self.train_ratio = 0.9
 
         # Save paths    
-        self.results_base_dir = "/mnt/data0/xiaoxiong/single_view_goal_diffusion/results/libero_spatial"
-        self.model_name = "RFlow_libero_spatial_100k_90%"
+        self.results_base_dir = "./"
+        self.model_name = "MODEL_NAME"
         
         
         self.setup_wandb()

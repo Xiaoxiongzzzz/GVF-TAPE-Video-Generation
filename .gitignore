@@ -1,6 +1,7 @@
 results
 examples
 wandb
+temp_scripts
 *.gif
 *.mp4
 *.pt

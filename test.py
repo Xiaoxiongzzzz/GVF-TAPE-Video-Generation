@@ -1,3 +1,6 @@
-import h5py 
-with h5py.File("/home/ZhangChuye/Documents/vik_module/data/lb90_8tk_raw/LIVING_ROOM_SCENE5_put_the_red_mug_on_the_left_plate_demo.hdf5") as f:
-    print(f['data']['demo_0']['obs'].keys())
+import h5py
+
+with h5py.File("/mnt/data0/xiaoxiong/atm_libero/libero_spatial_2/pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate_demo.hdf5") as F:
+    import ipdb; ipdb.set_trace()
+    print(F.keys())
+    
